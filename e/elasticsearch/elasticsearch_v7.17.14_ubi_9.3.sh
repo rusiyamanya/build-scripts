@@ -58,3 +58,6 @@ mkdir -p distribution/packages/ppc64le-rpm
 mkdir -p distribution/archives/darwin-ppc64le-tar
 
 ./gradlew :distribution:archives:linux-ppc64le-tar:assemble --parallel
+
+# Tests
+./gradlew test -x :x-pack:plugin:ml:test --no-parallel --continue
