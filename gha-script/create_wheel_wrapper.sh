@@ -7,9 +7,28 @@ EXTRA_ARGS=${3:-""}
 POST_PROCESS_SCRIPT_PATH=${4:-"post_process_wheel.py"}
 CURRENT_DIR=$(pwd)
 
-# install gcc
-yum install -y gcc-toolset-13 
-source /opt/rh/gcc-toolset-13/enable
+# Use sudo for yum when running as a non-root user (non-root container builds).
+# dockerfile_non_root grants test_user passwordless sudo, so this is always safe.
+# When already root, sudo is not needed (and may not be installed), so skip it.
+if [[ "$(id -u)" -ne 0 ]]; then
+    YUM="sudo yum"
+else
+    YUM="yum"
+fi
+
+# install gcc — select toolset version based on UBI major version
+UBI_MAJOR=$(grep -oP '(?<=^VERSION_ID=")[0-9]+' /etc/os-release || grep -oP 'release \K[0-9]+' /etc/redhat-release 2>/dev/null || echo "8")
+if [[ "$UBI_MAJOR" -ge 10 ]]; then
+    GCC_TOOLSET="gcc-toolset-15"
+    $YUM install -y "$GCC_TOOLSET"
+    # On UBI 10, SCL (Software Collections) was dropped — there is no enable script.
+    # Activate the toolset by prepending its bin directory to PATH directly.
+    export PATH="/opt/rh/${GCC_TOOLSET}/root/usr/bin:$PATH"
+else
+    GCC_TOOLSET="gcc-toolset-13"
+    $YUM install -y "$GCC_TOOLSET"
+    source /opt/rh/${GCC_TOOLSET}/enable
+fi
 gcc --version
 
 # temporary build script path
@@ -27,45 +46,48 @@ install_python_version() {
     echo
     case $version in
     "3.11" | "3.12")
-        yum install -y python${version} python${version}-devel python${version}-pip
+        $YUM install -y python${version} python${version}-devel python${version}-pip
         ;;
     "3.10")
         if ! python3.10 --version &>/dev/null; then
-            yum install -y sudo zlib-devel wget ncurses git make cmake openssl-devel xz xz-devel
-            yum install -y libffi libffi-devel sqlite sqlite-devel sqlite-libs bzip2-devel
+            $YUM install -y zlib-devel wget ncurses git make cmake openssl-devel xz xz-devel
+            $YUM install -y libffi libffi-devel sqlite sqlite-devel sqlite-libs bzip2-devel
             wget https://www.python.org/ftp/python/3.10.20/Python-3.10.20.tgz
             tar xf Python-3.10.20.tgz
             cd Python-3.10.20
-            ./configure --prefix=/usr/local --enable-optimizations
+            ./configure --prefix=/usr/local --enable-optimizations --enable-shared
             make -j2
             make altinstall
+            echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/python-local.conf && sudo ldconfig
             echo "Completed..."
             cd .. && rm -rf Python-3.10.20.tgz
         fi
         ;;
     "3.13")
         if ! python3.13 --version &>/dev/null; then
-            yum install -y sudo zlib-devel wget ncurses git make cmake openssl-devel xz xz-devel
-            yum install -y libffi libffi-devel sqlite sqlite-devel sqlite-libs bzip2-devel
+            $YUM install -y zlib-devel wget ncurses git make cmake openssl-devel xz xz-devel
+            $YUM install -y libffi libffi-devel sqlite sqlite-devel sqlite-libs bzip2-devel
             wget https://www.python.org/ftp/python/3.13.10/Python-3.13.10.tgz
             tar xzf Python-3.13.10.tgz
             cd Python-3.13.10
-            ./configure --prefix=/usr/local --enable-optimizations
+            ./configure --prefix=/usr/local --enable-optimizations --enable-shared
             make -j2
             make altinstall
+            echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/python-local.conf && sudo ldconfig
             cd .. && rm -rf Python-3.13.10.tgz
         fi
         ;;
     "3.14")
         if ! python3.14 --version &>/dev/null; then
-            yum install -y sudo zlib-devel wget ncurses git make cmake openssl-devel xz xz-devel
-            yum install -y libffi libffi-devel sqlite sqlite-devel sqlite-libs bzip2-devel
+            $YUM install -y zlib-devel wget ncurses git make cmake openssl-devel xz xz-devel
+            $YUM install -y libffi libffi-devel sqlite sqlite-devel sqlite-libs bzip2-devel
             wget https://www.python.org/ftp/python/3.14.3/Python-3.14.3.tgz
             tar xzf Python-3.14.3.tgz
             cd Python-3.14.3
-            ./configure --prefix=/usr/local --enable-optimizations
+            ./configure --prefix=/usr/local --enable-optimizations --enable-shared
             make -j2
             make altinstall
+            echo "/usr/local/lib" | sudo tee /etc/ld.so.conf.d/python-local.conf && sudo ldconfig
             cd .. && rm -rf Python-3.14.3.tgz
         fi
         ;;
@@ -245,9 +267,23 @@ echo
 WHEELHOUSE="$CURRENT_DIR/wheelhouse"
 mkdir -p "$WHEELHOUSE"
 
+# Build auditwheel exclusion arguments from build_info.json
+EXCLUDE_ARGS=()
+if [ -n "$AUDITWHEEL_EXCLUDE" ]; then
+  echo "Adding package-specific auditwheel exclusions: $AUDITWHEEL_EXCLUDE"
+  read -ra exclude_libs <<< "$AUDITWHEEL_EXCLUDE"
+  for lib in "${exclude_libs[@]}"; do
+    EXCLUDE_ARGS+=("--exclude" "$lib")
+  done
+else
+  echo "No auditwheel exclusions defined in build_info.json"
+fi
+
+echo "Auditwheel exclusion arguments: ${EXCLUDE_ARGS[*]}"
+
 # run auditwheel
 set +e
-audit_output=$(auditwheel repair "$wheel_file" --wheel-dir "$WHEELHOUSE" --exclude libtvm_ffi.so --exclude libtensorflow_framework.so.2 --exclude libpython3.11.so.1.0 --exclude libpython3.10.so.1.0 --exclude libpython3.12.so.1.0 --exclude libpython3.13.so.1.0 --exclude libc10.so --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_python.so --exclude libshm.so --exclude libtorchaudio.so --exclude libtorchtext.so --exclude libavutil-ffmpeg.so.54 --exclude libavformat-ffmpeg.so.56 --exclude libswscale-ffmpeg.so.3 --exclude libavcodec-ffmpeg.so.56 --exclude libavformat.so.57 --exclude libswscale.so.4 --exclude libavutil.so.55 --exclude libswscale.so.5 --exclude libavformat.so.58 2>&1)
+audit_output=$(auditwheel repair "$wheel_file" --wheel-dir "$WHEELHOUSE" "${EXCLUDE_ARGS[@]}" 2>&1)
 audit_status=$?
 set -e
 
@@ -308,6 +344,28 @@ cd "$CURRENT_DIR"
 wheel_final=(*.whl)
 
 echo
+echo "============== Running CVE scan on: ${wheel_final} =============="
+echo
+
+# Run CVE scanner — passes wheel + original build script so Lane 3 can parse
+# git clone/checkout lines for source-built lib names and versions.
+# Scanner is non-blocking — failure does not stop the build.
+SCANNER_PATH="gha-script/generalized_wheel_scanner.py"
+if [ -f "$SCANNER_PATH" ]; then
+    if python "$SCANNER_PATH" "${wheel_final}" "${BUILD_SCRIPT_PATH}"; then
+        echo
+        echo "===> CVE scan completed successfully."
+        echo
+    else
+        echo
+        echo "===> WARNING: CVE scan failed. Continuing build."
+        echo
+    fi
+else
+    echo "===> WARNING: $SCANNER_PATH not found, skipping CVE scan."
+fi
+
+echo
 echo "============== Generating sha for: ${wheel_final} =============="
 echo
 
@@ -320,16 +378,27 @@ echo
 echo "=== Post Processing wheel ${wheel_final} with SHA: ${SHA256_VALUE} ==="
 echo
 
+# Save CVE report name before post-processing renames the wheel
+cve_report_old="${wheel_final%.whl}_cve_report.json"
+
 # post processing of wheels (Suffix addition, license addition, metadata addition)
 if python ${POST_PROCESS_SCRIPT_PATH} ${wheel_final} ${SHA256_VALUE}; then
-    echo 
+    echo
     echo "===> SUCCESS: Wheels post process successfully."
     echo
 else
     echo
     echo "===> ERROR: Failed to post process wheels."
     echo
-    exit 1  
+    exit 1
+fi
+
+# Rename CVE report to match the post-processed wheel filename
+wheel_post_processed=(*.whl)
+cve_report_new="${wheel_post_processed[0]%.whl}_cve_report.json"
+if [ -f "$cve_report_old" ] && [ "$cve_report_old" != "$cve_report_new" ]; then
+    mv "$cve_report_old" "$cve_report_new"
+    echo "===> CVE report renamed: $cve_report_old → $cve_report_new"
 fi
 
 echo
